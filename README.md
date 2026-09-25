@@ -95,12 +95,13 @@ macOS / Linux 没有这条路径（客户端凭据结构不同，未逆向），
 
 ```
 --status            只列活动，不领取
---once              只试一次，不重试（调试 / cron 用）
+--once              只试一次，不重试（调试 / 给自动化任务用，推荐）
 --dry-run           只看会领到什么，不真领
---json              输出一行 JSON，方便被 cron / CI / 监控解析
+--json              输出一行 JSON，方便被自动化任务或上层脚本解析
 --base-url URL      手动指定端点，默认自动挑
---force             忽略本地 state，今天领过也再打一次（幂等，不会重复发币）
---token / --from-file / --from-env  见上表
+--force             忽略本地 state，重新向服务端确认（幂等，不会重复发币）
+--token TOKEN       直接给 access token（也可用环境变量 QODER_CLAIM_TOKEN）
+--from-file PATH    从 JSON 文件读 {token, refreshToken}
 ```
 
 退出码：
@@ -118,28 +119,50 @@ macOS / Linux 没有这条路径（客户端凭据结构不同，未逆向），
 {"verdict": "claimed", "detail": "+100 Credits (act-20260923-214)", "date": "2026-09-26", "endpoint": "https://openapi.qoder.sh"}
 ```
 
-## 定时执行
+## 定时执行：用 Qoder 自带的「自动化」
 
-**Windows（任务计划程序）** —— 注意必须是"只在用户登录时运行"，否则 DPAPI 解不开：
+不用碰任务计划程序 / crontab。Qoder 客户端左侧栏有个「自动化」面板，能建定时任务、看每次执行记录、手动补跑、随时暂停 —— 对这种每天一次的小事刚好。
 
-```powershell
-$action  = New-ScheduledTaskAction -Execute "pythonw.exe" `
-          -Argument "C:\path\to\qoder_claim.py" -WorkingDirectory "C:\path\to"
-$trigger = New-ScheduledTaskTrigger -Daily -At 10:01am
-Register-ScheduledTask -TaskName QoderClaim -Action $action -Trigger $trigger `
-          -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable) -User "$env:USERNAME"
+**唯一的限制**：本地自动化只在 Qoder 客户端进程存在时才会触发（不用前台，托盘里就行）。所以要么电脑常开，要么把 Qoder 设成开机自启。错过 10:01 不致命 —— 活动窗口有 24 小时，在面板里点一次「立即运行」就补上了。
+
+### 做法一：直接让 Agent 建（推荐，30 秒）
+
+在 Qoder 对话框里发这句，路径换成你自己的：
+
+> 建一个每天 10:01（Asia/Shanghai）的自动化任务：运行 `python D:/path/to/qoder_claim.py --once`，按它的输出用一句中文汇报结论。不要修改我的任何文件，不要自己写循环重试。
+
+Agent 会用内置的 `qoder_cron` 工具建好，建完在「自动化」面板就能看到。
+
+### 做法二：面板里手动填
+
+| 字段 | 填什么 | 为什么 |
+| --- | --- | --- |
+| 名称 | `Qoder 每日 Credits 签到` | 随便 |
+| 计划类型 | Cron | 要按"每天几点"跑就选 cron |
+| 表达式 | `1 10 * * *` | 10:01 触发；想加兜底填 `1 10,20 * * *`，10:01 和 20:01 各试一次 |
+| 时区 | `Asia/Shanghai` | 活动按 UTC+8 刷新，时区选错就天天错过 |
+| 工作目录 | 脚本所在目录 | |
+| 模型 | 最便宜的那个就够 | 每次触发都会开一个 Agent 会话、消耗少量 Credits；这活儿只是跑一条命令 |
+| 权限 | 自动批准（或 Full Access） | 选需要确认的模式，定时任务会卡在"等人点同意"上，等于没跑 |
+| 输出 | 独立会话（independent） | 每天一次，不需要上下文延续 |
+
+指令（prompt）直接粘这段，把路径换掉：
+
+```
+运行 `python D:/path/to/qoder_claim.py --once`，这条命令自己会完成查询和领取。
+按它的输出用一句中文汇报结论：
+- verdict=claimed → 今日签到成功，把到账的 Credits 数报出来
+- verdict=done    → 今天已经领过了，结束
+- verdict=pending / 退出码 1 → 本轮没领到，说下一个触发点会自动再试
+- 退出码 2 或 3   → 拿不到登录态：再跑一次 --status，把输出原样贴出来，并提示我需要在 Qoder 里重新登录
+不要修改任何文件，不要自己写循环或 sleep 重试，整个任务一分钟内结束。
 ```
 
-**Linux / macOS（cron）** —— 用环境变量传 token：
+### 建完先验一次
 
-```cron
-1 10 * * * QODER_CLAIM_TOKEN=xxxx python3 /path/to/qoder_claim.py --once >> $HOME/.local/share/qoder-claim/cron.log 2>&1
-```
+面板里对该任务点「立即运行」，然后看它的执行记录：脚本输出一行 `{"verdict": ...}` 就是通了，任务状态显示 `succeeded` 说明自动化这一环没问题。别等第二天才发现配错了。
 
-**Qoder 自带的「自动化」面板** —— 也可以建一个每天 10:01 触发的本地任务，让它执行
-`python qoder_claim.py --once`。限制是只在客户端运行时才会触发。
-
-开机/唤醒错过 10:01 也不怕：活动窗口有 24 小时，`StartWhenAvailable`（或手动补跑一次）就能补上。
+> 本工具对调度方式没有任何要求，接到你自己习惯的定时器里也行；本文只写 Qoder 自动化这一种。
 
 ## 文件位置
 
@@ -159,7 +182,9 @@ Register-ScheduledTask -TaskName QoderClaim -Action $action -Trigger $trigger `
 - 这波活动本身有结束时间（当前账号看到 `endAt` 在 2026-09-30 前后），活动下线后
   `campaigns` 会返回空列表，脚本会安静地报 `done`。
 - 只对"发币型"活动（`CLAIM_BENEFIT`）有效；其它 `actionType` 会被忽略。
-- 每天第一次成功前，脚本最多按 60s 间隔重试 20 次（默认），因为活动偶尔在 10:00 之后几十秒才下发。
+- 不带 `--once` 时，脚本自己会按 60s 间隔最多重试 20 次（活动偶尔在 10:00 之后几十秒才下发）。
+  挂到自动化面板上时建议加 `--once`：让调度器负责重试，任务本身一分钟内结束，别占着会话。
+- 自动化面板里配 `1 10,20 * * *` 这种双触发点，比让脚本干等 20 分钟省 Credits。
 
 ## 风险与合规
 
@@ -187,7 +212,12 @@ idempotent (`replayed: true`) so retrying is safe. The daily window is 10:00 →
 the `campaignId` rotates every day, so nothing is hardcoded. On Windows it can decrypt the
 desktop client's Chromium-style `v10` credential store in-place (DPAPI + AES-256-GCM via
 `ctypes`/CNG, no `pip install`) — read-only, never written back, never sent anywhere else.
-Elsewhere, pass `--token`. This is an unofficial third-party tool: it can break on any client
-update and automating a promo endpoint may not be covered by the service terms.
+Elsewhere, pass `--token`. For scheduling, use Qoder's built-in **Automations** panel rather
+than a system scheduler — see the "定时执行" section for the exact cron expression, timezone
+(`Asia/Shanghai`, since the campaign refreshes at 10:00 UTC+8) and prompt to paste; local
+automations only fire while the Qoder client is running, and the campaign window is 24 hours
+so a missed 10:01 run can just be triggered manually. This is an unofficial third-party tool:
+it can break on any client update and automating a promo endpoint may not be covered by the
+service terms.
 
 </details>
