@@ -6,21 +6,19 @@ qoder-claim —— Qoder 每日活动 Credits 自动领取（单文件，零第�
   GET  {base}/sash/api/v1/me/campaigns
   POST {base}/sash/api/v1/me/campaigns/{campaignId}/claim      （幂等）
 
-两条硬知识（逆向 Qoder 桌面客户端 0.4.2 得到）：
-  * 请求头必须带 `Cosy-ClientType: 10`，否则服务端返回空活动列表。
-  * 活动窗口是每天 10:00 ~ 次日 09:59（UTC+8），campaignId 每天更换，
-    所以绝不写死 ID，每次从列表里找 CLAIM_BENEFIT + CLAIMABLE。
-
 Token 从哪来（三选一，按优先级）：
   1. --token / 环境变量 QODER_CLAIM_TOKEN      —— 跨平台，最透明
   2. --from-file PATH                          —— 自己从别处导出的 JSON
   3. Windows 自动读取本机 Qoder 桌面端登录态    —— 见 read_local_session() 的说明
 
+不写任何文件：没有日志、没有 state、不把 token 落到别处，输出只有 stdout。
+
 用法：
   python qoder_claim.py --status              # 只读，看当前活动
   python qoder_claim.py                       # 领取（带重试）
-  python qoder_claim.py --once --dry-run      # 只试一次、不真领
-  python qoder_claim.py --json                # 机器可读输出，塞 cron 方便
+  python qoder_claim.py --once                # 只试一次，不重试（挂定时任务用）
+  python qoder_claim.py --once --dry-run      # 只试一次、且不真领
+  python qoder_claim.py --json                # 输出一行 JSON，便于被自动化任务解析
 
 退出码：0 成功/已领   1 本轮没领到   2 拿不到 token   3 参数或环境不支持
 """
@@ -41,7 +39,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------- 常量
 
@@ -59,26 +57,11 @@ RETRY_INTERVAL_S = 60
 MAX_ATTEMPTS = 20
 
 IS_WINDOWS = sys.platform == "win32"
-
-
-def data_dir() -> Path:
-    """可写数据目录（日志 + 状态），不硬编码任何盘符。"""
-    override = os.environ.get("QODER_CLAIM_HOME")
-    if override:
-        return Path(override).expanduser()
-    if IS_WINDOWS:
-        return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "qoder-claim"
-    xdg = os.environ.get("XDG_DATA_HOME")
-    return Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share" / "qoder-claim"
-
-
-LOG_FILE = data_dir() / "qoder-claim.log"
-STATE_FILE = data_dir() / "state.json"
-VERBOSE = True
+QUIET = False                                    # --json 时置真：只往 stdout 打一行 JSON
 
 
 def _init_stdio() -> None:
-    """控制台是 GBK/CP437 时也别因为一个中文字崩掉；文件日志始终是 UTF-8。"""
+    """控制台是 GBK/CP437 时也别因为一个中文字崩掉。"""
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             try:
@@ -88,51 +71,30 @@ def _init_stdio() -> None:
 
 
 def log(msg: str) -> None:
+    """唯一的输出通道：stdout。本工具不写任何文件。"""
+    if QUIET or sys.stdout is None:
+        return
     line = f"[{datetime.now(TZ_LOCAL).strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass                                    # 日志写不进去不是致命错误
-    if VERBOSE and sys.stdout is not None:
-        try:
-            print(line)
-        except UnicodeEncodeError:               # Windows GBK 控制台兜底
-            print(line.encode("gbk", "replace").decode("gbk"))
+        print(line)
+    except UnicodeEncodeError:                   # 极端情况下 reconfigure 没生效的兜底
+        print(line.encode("ascii", "replace").decode("ascii"))
 
 
 def today() -> str:
     return datetime.now(TZ_LOCAL).strftime("%Y-%m-%d")
 
 
-def read_state() -> dict:
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def write_state(**kv) -> None:
-    st = read_state()
-    st.update(kv)
-    try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
-    except OSError as exc:
-        log(f"写状态文件失败（不影响领取）：{exc}")
-
-
 # ---------------------------------------------------------------- 本地登录态（Windows）
 #
-# Qoder 桌面端把 {token, refreshToken, expiresAt} 存在
-#   %APPDATA%\com.qoder.app.<channel>\auth.v1.dat
-# 这是 Chromium 的 v10 格式：AES-256-GCM，密钥 = DPAPI 解开同目录
-# `Local State` 里的 os_crypt.encrypted_key。
-#
-# 前提：同一个 Windows 用户、已登录桌面（DPAPI 的固有约束）。
-# 本工具**只读不写**这个文件，也绝不把 token 落到别处。
-# macOS/Linux 请改用 --token。
+# Qoder 桌面端把登录凭据存在 %APPDATA%\com.qoder.app.<channel>\auth.v1.dat，
+# 是 Chromium 那种「DPAPI 包住的密钥 + AES-GCM」格式。本工具做的事：
+#   * 只读这个文件，绝不写、绝不复制走；
+#   * 解密优先用已安装的 cryptography，没装就降级用 Windows 自带的 CNG（bcrypt.dll），
+#     所以零 pip 依赖；
+#   * 只要 --token 有值，这一整段代码都不会被调用。
+# 约束：DPAPI 绑定 Windows 用户，必须有该用户已登录的桌面会话。
+# macOS / Linux 请改用 --token。
 
 class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
@@ -264,8 +226,8 @@ class Api:
     def __init__(self, token: str, bases: list[str], refresh: str | None = None):
         self.token = token
         self.refresh = refresh
-        self.bases = bases
-        self.base: str | None = None
+        self.bases = list(bases)
+        self.base: str | None = None       # 只在本次进程里记住能用的端点，不落盘
 
     def _raw(self, base: str, path: str, method: str = "GET") -> tuple[int, dict | str]:
         req = urllib.request.Request(
@@ -405,10 +367,22 @@ def build_api(args) -> Api:
     if not token:
         raise NoToken("拿不到 token：用 --token / QODER_CLAIM_TOKEN 提供，或在 Windows 上装好并登录 Qoder 桌面端")
     bases = [args.base_url] if args.base_url else DEFAULT_BASES
-    cached = read_state().get("base")
-    if cached and not args.base_url and cached not in bases:
-        bases.append(cached)
     return Api(token, bases, refresh)
+
+
+def out(text: str) -> None:
+    if sys.stdout is not None:
+        print(text)
+
+
+def fail(args, code: int, msg: str) -> int:
+    """启动阶段就失败时也要有输出：--json 模式下不能一声不吭只留个退出码。"""
+    if args.as_json:
+        out(json.dumps({"verdict": "error", "detail": msg, "date": today(),
+                        "endpoint": None}, ensure_ascii=False))
+    else:
+        log(msg)
+    return code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -419,41 +393,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-file", help="从 JSON 文件读 {token, refreshToken}")
     parser.add_argument("--base-url", help="指定 API 端点，默认自动在 .sh / .com.cn 之间挑")
     parser.add_argument("--status", action="store_true", help="只列活动，不领取")
-    parser.add_argument("--once", action="store_true", help="只试一次，不重试")
+    parser.add_argument("--once", action="store_true", help="只试一次，不重试（挂定时任务用）")
     parser.add_argument("--dry-run", action="store_true", help="只查询会领到什么，不真领")
-    parser.add_argument("--json", action="store_true", dest="as_json", help="输出一行 JSON，便于 cron/CI")
-    parser.add_argument("--force", action="store_true", help="忽略本地 state，重新向服务端确认（claim 幂等，不会重复发币）")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="只输出一行 JSON（过程信息全部静音），便于被自动化任务解析")
     args = parser.parse_args(argv)
 
-    global VERBOSE
+    global QUIET
     _init_stdio()
-    VERBOSE = not args.as_json
+    QUIET = args.as_json
 
     try:
         api = build_api(args)
     except NoToken as exc:
-        log(f"没有 token：{exc}")
-        return 2
+        return fail(args, 2, f"没有 token：{exc}")
     except Exception as exc:
-        log(f"初始化失败：{exc}")
-        return 3
+        return fail(args, 3, f"初始化失败：{exc}")
 
     if args.status:
         code, payload = api.campaigns()
         rows = [describe(c) for c in payload.get("campaigns", [])] if isinstance(payload, dict) else []
         if args.as_json:
-            print(json.dumps({"http": code, "campaigns": rows}, ensure_ascii=False))
+            out(json.dumps({"http": code, "endpoint": api.base, "campaigns": rows}, ensure_ascii=False))
         else:
             log(f"GET /me/campaigns -> HTTP {code} @ {api.base}")
             for r in rows:
                 log("  · " + r)
         return 0 if code == 200 else 1
-
-    if not args.force and read_state().get("claimed_on") == today():
-        msg = f"state 显示今天({today()})已领取，加 --force 可再打一次接口（幂等，不会重复发币）"
-        (print if args.as_json else (lambda m: log(m)))(json.dumps({"verdict": "done", "detail": msg})
-                                                       if args.as_json else msg)
-        return 0
 
     attempts = 1 if args.once else MAX_ATTEMPTS
     verdict, detail = "pending", "未执行"
@@ -467,15 +433,11 @@ def main(argv: list[str] | None = None) -> int:
             log(f"[{i + 1}/{attempts}] {detail}，{RETRY_INTERVAL_S}s 后重试")
             time.sleep(RETRY_INTERVAL_S)
 
-    if verdict == "claimed":
-        write_state(claimed_on=today(), base=api.base,
-                    claimed_at=datetime.now(TZ_LOCAL).isoformat(timespec="seconds"))
-    elif verdict == "done" and not args.dry_run:
-        write_state(base=api.base)
-
-    payload_out = {"verdict": verdict, "detail": detail, "date": today(), "endpoint": api.base}
-    (print if args.as_json else (lambda m: log(m)))(json.dumps(payload_out, ensure_ascii=False)
-                                                   if args.as_json else f"{verdict}: {detail}")
+    result = {"verdict": verdict, "detail": detail, "date": today(), "endpoint": api.base}
+    if args.as_json:
+        out(json.dumps(result, ensure_ascii=False))
+    else:
+        log(f"{verdict}: {detail}")
     return {"claimed": 0, "done": 0, "pending": 1, "error": 1}[verdict]
 
 

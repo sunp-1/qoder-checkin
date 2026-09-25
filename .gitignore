@@ -1,13 +1,11 @@
 __pycache__/
 *.py[cod]
 
-# 运行产物：日志与 state 里虽然不含 token，但仍是你自己的账号痕迹
-qoder-claim.log
-state.json
-*.local.json
+# 凭据相关的一律不要进仓库
 session.json
 token.txt
 .env
+*.local.json
 
 # 本机私有包装脚本
 wrapper.*
