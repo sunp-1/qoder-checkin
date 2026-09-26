@@ -32,6 +32,9 @@ import ctypes.wintypes as wt
 import glob
 import json
 import os
+import platform
+import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -39,7 +42,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------- 常量
 
@@ -216,6 +219,168 @@ def read_local_session() -> dict:
     raise RuntimeError("所有 Qoder 目录都解不出登录态 -> " + "; ".join(errs))
 
 
+# ---------------------------------------------------------------- 设备标识（Windows）
+#
+# 服务端现在只给带上设备标识的请求下发每日活动。这份标识不编造、不联网换：
+# 直接运行 Qoder 客户端安装目录里自带的官方组件拿现成结果（客户端主进程每小时
+# 也以同样方式调用它一次）。本工具依旧不写任何文件，只多了几个请求头。
+# 找不到组件（比如没装客户端的机器）就自动退回普通请求，行为与 v1.1 一致。
+
+UMID_REL_PATH = ("resources", "umid", "runtime-info.exe")
+RISK_TTL_S = 1800          # 组件结果缓存 30 分钟（进程内）
+RISK_FAIL_TTL_S = 60       # 拿不到时 60 秒后可再试，不阻断重试循环
+_risk_cache: tuple[float, dict] = (0.0, {})
+_risk_warned = False
+
+
+def _registry_qoder_roots() -> list[Path]:
+    """从 HKCU/HKLM 卸载表里找 Qoder 的安装位置。"""
+    roots: list[Path] = []
+    if not IS_WINDOWS:
+        return roots
+    import winreg
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            key = winreg.OpenKey(hive, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+        except OSError:
+            continue
+        try:
+            count = winreg.QueryInfoKey(key)[0]
+        except OSError:
+            winreg.CloseKey(key)
+            continue
+        for i in range(count):
+            try:
+                with winreg.OpenKey(key, winreg.EnumKey(key, i)) as sub:
+                    name = str(winreg.QueryValueEx(sub, "DisplayName")[0]).lower()
+                    if "qoder" in name:
+                        loc = str(winreg.QueryValueEx(sub, "InstallLocation")[0]).strip()
+                        if loc:
+                            roots.append(Path(loc))
+            except OSError:
+                continue
+        winreg.CloseKey(key)
+    return roots
+
+
+def _running_qoder_roots() -> list[Path]:
+    """绿色安装往往不写注册表：退而求其次，问正在运行的 Qoder.exe 要路径（纯 ctypes）。"""
+    roots: list[Path] = []
+    if not IS_WINDOWS:
+        return roots
+    try:
+        kernel32 = ctypes.windll.kernel32
+
+        class Entry32(ctypes.Structure):
+            _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD),
+                        ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wt.DWORD),
+                        ("th32Threads", wt.DWORD), ("th32ParentProcessID", wt.DWORD),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", wt.DWORD),
+                        ("szExeFile", ctypes.c_char * 260)]
+
+        snap = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if snap in (0, -1):
+            return roots
+        try:
+            e = Entry32()
+            e.dwSize = ctypes.sizeof(e)
+            ok = kernel32.Process32First(snap, ctypes.byref(e))
+            while ok:
+                if e.szExeFile.decode("utf-8", "replace").lower() == "qoder.exe":
+                    h = kernel32.OpenProcess(0x1000, False, e.th32ProcessID)  # QUERY_LIMITED
+                    if h:
+                        try:
+                            buf = ctypes.create_unicode_buffer(32768)
+                            size = wt.DWORD(len(buf))
+                            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                                exe = Path(buf.value[: size.value])
+                                if exe.parent.exists():
+                                    roots.append(exe.parent)
+                        finally:
+                            kernel32.CloseHandle(h)
+                ok = kernel32.Process32Next(snap, ctypes.byref(e))
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception:
+        pass
+    seen, uniq = set(), []
+    for r in roots:
+        if str(r).lower() not in seen:
+            seen.add(str(r).lower())
+            uniq.append(r)
+    return uniq
+
+
+def _candidate_umid_exes() -> list[Path]:
+    env = os.environ.get("QODER_UMID_EXE")
+    if env:
+        return [Path(env).expanduser()]
+    local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    prog = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    prog86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    roots = [local / "Programs" / "Qoder", prog / "Qoder", prog86 / "Qoder"]
+    roots += _registry_qoder_roots() + _running_qoder_roots()
+    return [root.joinpath(*UMID_REL_PATH) for root in roots]
+
+
+def _umid_identity(exe: Path) -> dict:
+    try:
+        p = subprocess.run([str(exe), "--account-stdin"], input=b"", capture_output=True,
+                           timeout=40, cwd=str(exe.parent))
+        return json.loads(p.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
+    except Exception:
+        return {}
+
+
+def _machine_id() -> str:
+    for root in _appdata_dirs():
+        try:
+            v = (root / "auth.machine-id").read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except OSError:
+            continue
+    return ""
+
+
+def risk_headers() -> dict:
+    global _risk_cache, _risk_warned
+    if not IS_WINDOWS:
+        return {}
+    now = time.time()
+    ttl = RISK_TTL_S if _risk_cache[1] else RISK_FAIL_TTL_S
+    if now - _risk_cache[0] < ttl:
+        return _risk_cache[1]
+    h: dict[str, str] = {}
+    exe = next((p for p in _candidate_umid_exes() if p.exists()), None)
+    if exe:
+        ri = _umid_identity(exe)
+        arch = {"amd64": "x86_64", "x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"} \
+            .get(platform.machine().lower(), "x86_64")
+        h["Cosy-MachineOS"] = f"{arch}_windows"
+        h["Cosy-MachineHostname"] = socket.gethostname()
+        try:
+            pv = json.loads((exe.parent.parent / "build-manifest.json")
+                            .read_text(encoding="utf-8")).get("productVersion")
+            if pv:
+                h["Cosy-Version"] = str(pv)
+        except Exception:
+            pass
+        if mid := _machine_id():
+            h["Cosy-MachineId"] = mid
+        for src, dst in (("machineToken", "Cosy-MachineToken"),
+                         ("machineCode", "Cosy-MachineCode"),
+                         ("machineType", "Cosy-MachineType")):
+            if ri.get(src):
+                h[dst] = str(ri[src])
+    _risk_cache = (now, h)
+    if not h and not _risk_warned:
+        _risk_warned = True
+        log("未取到设备标识（本机没装 Qoder 客户端？），按普通请求继续；"
+            "若活动不下发，请在装有客户端的 Windows 上运行，或用 QODER_UMID_EXE 指定组件路径")
+    return h
+
+
 # ---------------------------------------------------------------- 服务端
 
 class NoToken(RuntimeError):
@@ -232,7 +397,7 @@ class Api:
     def _raw(self, base: str, path: str, method: str = "GET") -> tuple[int, dict | str]:
         req = urllib.request.Request(
             base + path, method=method,
-            headers={**HEADERS, "Authorization": f"Bearer {self.token}"},
+            headers={**HEADERS, **risk_headers(), "Authorization": f"Bearer {self.token}"},
             data=b"" if method == "POST" else None,
         )
         try:
@@ -271,7 +436,7 @@ class Api:
             return False
         req = urllib.request.Request(
             self.base + "/api/v1/deviceToken/refresh", method="POST",
-            headers={**HEADERS, "Content-Type": "application/json"},
+            headers={**HEADERS, **risk_headers(), "Content-Type": "application/json"},
             data=json.dumps({"refresh_token": self.refresh}).encode(),
         )
         try:
